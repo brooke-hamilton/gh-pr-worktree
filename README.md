@@ -1,6 +1,6 @@
 # gh-pr-worktree
 
-A GitHub CLI extension that creates git worktrees for GitHub Pull Requests, making it easy to review and test PRs in isolated directories.
+A GitHub CLI extension that creates [git worktrees](https://git-scm.com/docs/git-worktree) for GitHub Pull Requests, making it easy to review and test PRs in isolated directories.
 
 ## Features
 
