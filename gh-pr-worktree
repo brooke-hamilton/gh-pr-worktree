@@ -1,35 +1,171 @@
 #!/usr/bin/env bash
-set -e
 
-echo "Hello gh-pr-worktree!"
+set -euo pipefail
 
-# Snippets to help get started:
+# Constants
+readonly SCRIPT_NAME="${0##*/}"
 
-# Determine if an executable is in the PATH
-# if ! type -p ruby >/dev/null; then
-#   echo "Ruby not found on the system" >&2
-#   exit 1
-# fi
+usage() {
+  cat << EOF
+Usage: $SCRIPT_NAME <PR_NUMBER> [WORKTREE_DIR]
 
-# Pass arguments through to another command
-# gh issue list "$@" -R cli/cli
+Creates a git worktree for a GitHub Pull Request.
 
-# Using the gh api command to retrieve and format information
-# QUERY='
-#   query($endCursor: String) {
-#     viewer {
-#       repositories(first: 100, after: $endCursor) {
-#         nodes {
-#           nameWithOwner
-#           stargazerCount
-#         }
-#       }
-#     }
-#   }
-# '
-# TEMPLATE='
-#   {{- range $repo := .data.viewer.repositories.nodes -}}
-#     {{- printf "name: %s - stargazers: %v\n" $repo.nameWithOwner $repo.stargazerCount -}}
-#   {{- end -}}
-# '
-# exec gh api graphql -f query="${QUERY}" --paginate --template="${TEMPLATE}"
+Arguments:
+  PR_NUMBER     The GitHub PR number to checkout
+  WORKTREE_DIR  Directory for the worktree (default: ../pr-<PR_NUMBER>)
+
+Examples:
+  $SCRIPT_NAME 123
+  $SCRIPT_NAME 456 /tmp/pr-456-review
+EOF
+  exit "${1:-1}"
+}
+
+error() {
+  echo "Error: $*" >&2
+  exit 1
+}
+
+check_dependencies() {
+  local missing_deps=()
+  
+  for cmd in gh jq git; do
+    if ! command -v "$cmd" &> /dev/null; then
+      missing_deps+=("$cmd")
+    fi
+  done
+  
+  if [[ ${#missing_deps[@]} -gt 0 ]]; then
+    error "Missing required commands: ${missing_deps[*]}"
+  fi
+}
+
+validate_pr_number() {
+  local pr_number="$1"
+  if ! [[ "$pr_number" =~ ^[0-9]+$ ]]; then
+    error "PR number must be a positive integer, got: $pr_number"
+  fi
+}
+
+cleanup_on_error() {
+  local remote="$1"
+  local should_remove="$2"
+  
+  if [[ "$should_remove" == "true" ]] && git remote | grep -q "^$remote$" 2>/dev/null; then
+    echo "Cleaning up remote '$remote'..." >&2
+    git remote remove "$remote" 2>/dev/null || true
+  fi
+}
+
+cleanup_handler() {
+  cleanup_on_error "$pr_remote" "$added_remote"
+}
+
+main() {
+  # Check arguments
+  if [[ $# -lt 1 ]] || [[ "$1" == "-h" ]] || [[ "$1" == "--help" ]]; then
+    usage 0
+  fi
+  
+  local pr_number="$1"
+  local worktree_dir="${2:-../pr-$pr_number}"
+  local pr_remote="" # Will be set after we get PR info
+  local added_remote=false
+  
+  # Validation
+  check_dependencies
+  validate_pr_number "$pr_number"
+  
+  # Check if we're in a git repository
+  if ! git rev-parse --git-dir &> /dev/null; then
+    error "Not in a git repository"
+  fi
+  
+  # Check if worktree directory already exists
+  if [[ -e "$worktree_dir" ]]; then
+    error "Directory '$worktree_dir' already exists"
+  fi
+  
+  # Get PR info using GitHub CLI
+  echo "Fetching PR info for #$pr_number..."
+  local pr_json
+  if ! pr_json=$(gh pr view "$pr_number" --json headRefName,headRepository,headRepositoryOwner,baseRefName 2>/dev/null); then
+    error "Failed to fetch PR #$pr_number. Check that the PR exists and you have access."
+  fi
+  
+  local pr_branch pr_repo_url repo_owner
+  pr_branch=$(jq -r '.headRefName' <<<"$pr_json") || error "Failed to parse PR branch name"
+  repo_owner=$(jq -r '.headRepositoryOwner.login' <<<"$pr_json") || error "Failed to parse repository owner"
+  
+  # Get the current repository info to compare
+  local current_repo_url
+  if ! current_repo_url=$(git remote get-url origin 2>/dev/null); then
+    error "Could not determine current repository URL from origin remote"
+  fi
+  
+  # Normalize URLs for comparison (remove .git suffix and ensure https format)
+  current_repo_url=$(echo "$current_repo_url" | sed 's/\.git$//' | sed 's|git@github.com:|https://github.com/|')
+  
+  # Check if PR is from the same repository (branch) or a fork
+  local repo_name
+  repo_name=$(jq -r '.headRepository.name' <<<"$pr_json") || error "Failed to parse repository name"
+  pr_repo_url="https://github.com/$repo_owner/$repo_name"
+  
+  # Determine if this is a fork or same-repo branch
+  if [[ "$pr_repo_url" == "$current_repo_url" ]]; then
+    pr_remote="origin"
+  else
+    pr_remote="$repo_owner"
+  fi
+  
+  # Add .git suffix for clone URL
+  pr_repo_url="$pr_repo_url.git"
+  
+  # Validate parsed data
+  if [[ "$pr_branch" == "null" ]] || [[ -z "$pr_branch" ]]; then
+    error "Could not determine PR branch name"
+  fi
+  
+  if [[ "$repo_owner" == "null" ]] || [[ -z "$repo_owner" ]]; then
+    error "Could not determine repository owner"
+  fi
+  
+  # Set up error cleanup
+  trap 'cleanup_handler' ERR
+  
+  # Check if remote exists, add if not (only for forks)
+  if [[ "$pr_remote" != "origin" ]]; then
+    if ! git remote | grep -q "^$pr_remote$"; then
+      echo "Adding remote '$pr_remote'..."
+      git remote add "$pr_remote" "$pr_repo_url"
+      added_remote=true
+    else
+      echo "Remote '$pr_remote' already exists"
+    fi
+  fi
+  
+  # Fetch the PR branch
+  echo "Fetching branch '$pr_branch' from '$pr_remote'..."
+  git fetch "$pr_remote" "$pr_branch"
+  
+  # Create the worktree
+  echo "Creating worktree at '$worktree_dir'..."
+  git worktree add "$worktree_dir" "$pr_branch"
+  
+  # Clear the trap since we succeeded
+  trap - ERR
+  
+  echo
+  echo "✓ Worktree created at '$worktree_dir' for PR #$pr_number"
+  echo "  Branch: $pr_branch"
+  echo "  Remote: $pr_remote"
+  echo
+  echo "To remove when done:"
+  echo "  git worktree remove '$worktree_dir'"
+  if [[ "$added_remote" == "true" ]]; then
+    echo "  git remote remove '$pr_remote'  # (cleanup added remote)"
+  fi
+}
+
+main "$@"
